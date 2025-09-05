@@ -31,6 +31,8 @@ __all__ = (
     'current_app', 'current_task', 'maybe_signature',
     'chain', 'chord', 'chunks', 'group', 'signature',
     'xmap', 'xstarmap', 'uuid',
+    # new tracing related classes
+    'TaskTracer', 'TaskTimer', 'RetryManager', 'TaskLogger',
 )
 
 VERSION_BANNER = f'{__version__} ({SERIES})'
@@ -159,6 +161,7 @@ old_module, new_module = local.recreate_module(  # pragma: no cover
             'xmap', 'xstarmap',
         ],
         'celery.utils': ['uuid'],
+        'celery.app.trace': ['TaskTracer', 'TaskTimer', 'RetryManager', 'TaskLogger'],
     },
     __package__='celery', __file__=__file__,
     __path__=__path__, __doc__=__doc__, __version__=__version__,

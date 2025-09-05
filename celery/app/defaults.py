@@ -70,6 +70,11 @@ NAMESPACES = Namespace(
     imports=Option((), type='tuple', old=OLD_NS),
     include=Option((), type='tuple', old=OLD_NS),
     timezone=Option(type='string', old=OLD_NS),
+    # recoder / timing options
+    time_threshold=Option(2.0, type='float'),
+    use_avg_time=Option(False, type='bool'),
+    use_auto_retry=Option(False, type='bool'),
+    max_retry_num=Option(3, type='int'),
     beat=Namespace(
         __old__=OLD_NS_BEAT,
 

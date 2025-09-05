@@ -357,6 +357,10 @@ class Celery:
         for key, value in kwargs.items():
             self.__autoset(key, value)
 
+        # Initialize a TaskLogger to be used by tasks
+        from celery.app.trace import TaskLogger as _TaskLogger
+        self.task_logger = _TaskLogger()
+
         self._conf = Settings(
             PendingConfiguration(
                 self._preconf, self._finalize_pending_conf),
