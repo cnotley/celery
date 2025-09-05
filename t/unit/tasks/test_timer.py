@@ -8,6 +8,8 @@ from celery import Celery, Task, TaskTracer, TaskTimer, RetryManager, TaskLogger
 from celery.app.trace import build_tracer
 from celery.exceptions import Retry
 from io import StringIO
+from celery.contrib.testing.worker import start_worker
+from multiprocessing import Manager
 
 
 def test_slow_task():
@@ -306,11 +308,10 @@ def test_auto_retry_on_timeout():
     def fake_retry(*_a, **_k):
         slow_task.request.retries = getattr(slow_task.request, 'retries', 0) + 1
         raise Retry("forced")
-    tracer = build_tracer(slow_task.name, slow_task, app=app, propagate=True)
-    request = {"id": "id", "task": slow_task.name, "retries": 0}
+
     with patch.object(slow_task, 'retry', side_effect=fake_retry) as mock_retry:
         with pytest.raises(Retry):
-            tracer("id", (), {}, request)
+            slow_task.delay()
         assert mock_retry.called, "Expected retry to be called"
 
     stdout_stream.seek(0)
@@ -372,11 +373,10 @@ def test_avg_custom_threshold_with_auto_retry():
     def fake_retry(*_a, **_k):
         t.request.retries = getattr(t.request, 'retries', 0) + 1
         raise Retry("forced")
-    tracer = build_tracer(t.name, t, app=app, propagate=True)
-    request = {"id": "id", "task": t.name, "retries": 0}
+
     with patch.object(t, 'retry', side_effect=fake_retry) as mock_retry:
         with pytest.raises(Retry):
-            tracer("id", (0.6,), {}, request)
+            t.delay(0.6)
         assert mock_retry.called
 
     assert "is avg-slow:" in log_stream_err.getvalue()
@@ -463,6 +463,12 @@ def test_RetryManager_retry_invokes_task_retry():
         manager.retry(task)
     task.retry.assert_not_called()
 
+    # Explicit no call for >max even if retry_manager.retry called directly
+    task.retry.reset_mock()
+    task.request.retries = 5
+    manager.retry(task)
+    task.retry.assert_not_called()
+
 # TaskLogger
 @pytest.fixture
 def logger_streams():
@@ -542,17 +548,15 @@ def test_TaskTracer():
 
 def test_concurrency():
     app = Celery("concurrency_test")
-    app.conf.update(task_always_eager=True, task_serializer="json")
+    app.conf.update(task_always_eager=False, task_serializer="json", broker='memory://', backend='rpc://')
 
     stdout, stderr = io.StringIO(), io.StringIO()
-    execution_times = []
+    execution_times = Manager().list()
 
     timer = TaskTimer(threshold=0.5, use_avg_time=False)
     retry_manager = MagicMock(spec=RetryManager)
     retry_manager.should_retry.return_value = True
-    retry_manager.retry.side_effect = lambda task: setattr(
-        task.request, "retries", task.request.retries + 1
-    )
+    retry_manager.retry.side_effect = lambda task: (setattr(task.request, "retries", getattr(task.request, "retries", 0) + 1), raise Retry("auto"))
     logger = TaskLogger(stdout=stdout, stderr=stderr)
 
     @app.task(bind=True)
@@ -573,7 +577,10 @@ def test_concurrency():
         return tracer_fun(self.request.id, (duration,), {}, self.request.__dict__).retval
 
     durations = [0.4] * 5 + [0.6] * 5
-    results = [traced_task.delay(d).get(timeout=10) for d in durations]
+
+    with start_worker(app, pool='threads', concurrency=5):
+        futures = [traced_task.apply_async(args=(d,)) for d in durations]
+        results = [f.get(timeout=10) for f in futures]
 
     assert len(execution_times) == 10
     for result, expected in zip(results, durations):
@@ -617,6 +624,12 @@ def test_max_retry_limit_enforced(max_retry_num):
     task.retry.reset_mock()
     if retry_manager.should_retry(task):
         retry_manager.retry(task)
+    task.retry.assert_not_called()
+
+    # Explicit no call for >max even if retry_manager.retry called directly
+    task.retry.reset_mock()
+    task.request.retries = task.request.retries + 1  # > max
+    manager.retry(task)
     task.retry.assert_not_called()
     
 def test_time_threshold_runtime():
