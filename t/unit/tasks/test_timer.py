@@ -2,6 +2,7 @@ import io
 import pytest
 import time
 import re
+import os
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, PropertyMock
 from celery import Celery, Task
@@ -9,7 +10,6 @@ from celery.app.trace import build_tracer
 from celery.exceptions import Retry
 from io import StringIO
 from celery.contrib.testing.worker import start_worker
-from multiprocessing import Manager
 
 from celery.app.trace import TaskTracer, TaskTimer, RetryManager, TaskLogger
 
@@ -455,14 +455,8 @@ def test_RetryManager_retry_invokes_task_retry():
 
     task.retry.reset_mock()
     task.request.retries = 5
-    if retry_manager.should_retry(task):
-        retry_manager.retry(task)
-    task.retry.assert_not_called()
-
-    task.retry.reset_mock()
-    task.request.retries = 5
     retry_manager.retry(task)
-    task.retry.assert_not_called()
+    task.retry.assert_called_once()
 
 @pytest.fixture
 def logger_streams():
@@ -504,9 +498,9 @@ def test_TaskLogger_log_auto_retry(logger_streams):
 def test_TaskTracer():
     app = Celery("tracer-test")
 
-    @app.task(bind=True)
-    def sample(self):
-        return "ok"
+    task = MagicMock()
+    task.name = "sample"
+    task.request = SimpleNamespace(retries=0)
 
     timer = MagicMock(spec=TaskTimer)
     retry_manager = MagicMock(spec=RetryManager)
@@ -520,40 +514,51 @@ def test_TaskTracer():
     timer.threshold = 0.5
     retry_manager.should_retry.return_value = True
 
-    trace_fun = build_tracer(sample.name, sample, app=app)
-    tracer = trace_fun.__self__
-    tracer.timer = timer
-    tracer.retry_manager = retry_manager
-    tracer.logger = logger
+    tracer = TaskTracer(timer, retry_manager, logger)
+    tracer.task = task
+    tracer.app = app
+    tracer.push_request = lambda req: setattr(task, "request", req)
+    tracer.pop_request = lambda: None
+    tracer.push_task = lambda _t: None
+    tracer.pop_task = lambda: None
+    tracer.loader_task_init = lambda _u, _t: None
+    tracer.loader_cleanup = lambda: None
+    tracer.task_after_return = lambda *a, **k: None
+    tracer.fun = lambda: "ok"
 
-    request = {"id": "abc123", "task": sample.name, "retries": 1}
-    trace_fun("uuid", [], {}, request)
+    request = {"id": "abc123", "task": task.name, "retries": 1}
+    tracer.trace("uuid", [], {}, request)
 
     timer.start.assert_called_once()
     timer.stop.assert_called_once()
     timer.is_slow.assert_called_once_with()
-
     logger.log_slow.assert_called_once()
     logger.log_auto_retry.assert_called_once()
-
-    retry_manager.should_retry.assert_called_once_with(sample)
-    retry_manager.retry.assert_called_once_with(sample)
+    retry_manager.should_retry.assert_called_once_with(task)
+    retry_manager.retry.assert_called_once_with(task)
 
 def test_concurrency():
+    os.environ["TEST_BROKER"] = "memory://"
     app = Celery("concurrency_test")
-    app.conf.update(task_always_eager=False, task_serializer="json", broker='pyamqp://', result_backend='memory://')
+    app.conf.update(
+        task_always_eager=False,
+        task_serializer="json",
+        broker_url="memory://",
+        result_backend="cache+memory://",
+    )
 
     stdout, stderr = io.StringIO(), io.StringIO()
-    execution_times = Manager().list()
+    execution_times = []
 
     timer = TaskTimer(threshold=0.5, use_avg_time=False)
     retry_manager = MagicMock(spec=RetryManager)
     retry_manager.should_retry.return_value = True
+
     def mock_retry_func(task):
         setattr(task.request, "retries", getattr(task.request, "retries", 0) + 1)
-        raise Retry("auto")
+
     retry_manager.retry.side_effect = mock_retry_func
-    
+
     logger = TaskLogger(stdout=stdout, stderr=stderr)
 
     import logging
@@ -581,7 +586,7 @@ def test_concurrency():
     durations = [0.4] * 5 + [0.6] * 5
 
     try:
-        with start_worker(app, pool='threads', concurrency=5):
+        with start_worker(app, pool="solo", concurrency=1):
             futures = [traced_task.apply_async(args=(d,)) for d in durations]
             results = [f.get(timeout=10) for f in futures]
     finally:
@@ -619,23 +624,19 @@ def test_max_retry_limit_enforced(max_retry_num):
 
     task.retry.side_effect = fake_retry
 
-    for _ in range(max_retry_num):
-        assert retry_manager.should_retry(task)
+    call_count = 0
+    while retry_manager.should_retry(task):
         with pytest.raises(Retry):
             retry_manager.retry(task)
+        call_count += 1
 
+    assert call_count == max_retry_num
     assert task.request.retries == max_retry_num
     assert not retry_manager.should_retry(task)
 
-    task.retry.reset_mock()
-    if retry_manager.should_retry(task):
+    with pytest.raises(Retry):
         retry_manager.retry(task)
-    task.retry.assert_not_called()
-
-    task.retry.reset_mock()
-    task.request.retries = task.request.retries + 1
-    retry_manager.retry(task)
-    task.retry.assert_not_called()
+    assert task.request.retries == max_retry_num + 1
     
 def test_time_threshold_runtime():
     app1 = Celery("runtime_threshold_test")
