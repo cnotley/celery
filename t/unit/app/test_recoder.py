@@ -1,4 +1,3 @@
-# Tests for task slow execution recoder and retry management.
 import io
 from unittest.mock import patch
 
@@ -12,8 +11,6 @@ def trace(app, task, args=(), kwargs=None, propagate=False,
     if kwargs is None:
         kwargs = {}
     tracer = build_tracer(task.name, task, eager=eager, propagate=propagate, app=app, **opts)
-    # The request mapping is only used by trace(); RetryManager methods receive
-    # the task instance as required by the public API.
     ret = tracer(task_id, args, kwargs, request)
     return ret.retval, ret.info
 
@@ -23,7 +20,6 @@ class TestRecoder:
         self.app = Celery('recoder-app')
 
     def test_slow_task_logging(self):
-        # force a log by setting threshold to 0 for instant slow detection
         self.app.conf.update(time_threshold=0.0)
         err_buf = io.StringIO()
         self.app.task_logger.set_stderr(err_buf)
@@ -36,7 +32,6 @@ class TestRecoder:
         assert 'slow' in err_buf.getvalue()
 
     def test_task_specific_threshold(self):
-        # Global threshold high so normally no log
         self.app.conf.update(time_threshold=10.0)
         err_buf = io.StringIO()
         self.app.task_logger.set_stderr(err_buf)
@@ -44,13 +39,11 @@ class TestRecoder:
         @self.app.task(shared=False)
         def just_task():
             return 'done'
-        # override threshold per task to always trigger
         just_task.task_time_threshold = 0.0
         trace(self.app, just_task, ())
         assert 'slow' in err_buf.getvalue()
 
     def test_average_time_logging(self):
-        # Use average and override global threshold to catch average slow
         self.app.conf.update(time_threshold=0.0, use_avg_time=True)
         err_buf = io.StringIO()
         self.app.task_logger.set_stderr(err_buf)
@@ -58,7 +51,6 @@ class TestRecoder:
         @self.app.task(shared=False)
         def noop():
             return 'noop'
-        # call task multiple times to build an average
         trace(self.app, noop, ())
         trace(self.app, noop, ())
         assert 'avg-slow' in err_buf.getvalue()
