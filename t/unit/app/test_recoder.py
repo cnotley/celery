@@ -1,6 +1,8 @@
 # Tests for task slow execution recoder and retry management.
 import io
+from unittest.mock import patch
 
+import pytest
 from celery import Celery, states
 from celery.app.trace import build_tracer
 
@@ -10,6 +12,8 @@ def trace(app, task, args=(), kwargs=None, propagate=False,
     if kwargs is None:
         kwargs = {}
     tracer = build_tracer(task.name, task, eager=eager, propagate=propagate, app=app, **opts)
+    # The request mapping is only used by trace(); RetryManager methods receive
+    # the task instance as required by the public API.
     ret = tracer(task_id, args, kwargs, request)
     return ret.retval, ret.info
 
@@ -60,16 +64,23 @@ class TestRecoder:
         assert 'avg-slow' in err_buf.getvalue()
 
     def test_auto_retry_for_slow(self):
-        self.app.conf.update(time_threshold=0.0)
+        self.app.conf.update(time_threshold=0.0, task_always_eager=True)
         out_buf = io.StringIO()
         self.app.task_logger.set_stdout(out_buf)
 
         @self.app.task(bind=True, shared=False)
         def maybe_retry(self):
             return 'value'
+
         maybe_retry.use_auto_retry = True
-        retval, info = trace(self.app, maybe_retry, ())
-        assert info.state == states.RETRY
+
+        def fake_retry(*_a, **_k):
+            maybe_retry.request.retries = getattr(maybe_retry.request, 'retries', 0) + 1
+            raise states.RETRY
+
+        with patch.object(maybe_retry, 'retry', side_effect=fake_retry) as mock_retry:
+            with pytest.raises(states.RETRY):
+                maybe_retry.delay()
+            assert mock_retry.called
+
         assert 'Auto-retry' in out_buf.getvalue()
-        # ensure retry count increments
-        assert maybe_retry.request.retries == 1

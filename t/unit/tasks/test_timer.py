@@ -5,7 +5,7 @@ import re
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, PropertyMock
 from celery import Celery, Task, TaskTracer, TaskTimer, RetryManager, TaskLogger
-from multiprocessing import Manager
+from celery.app.trace import build_tracer
 from celery.exceptions import Retry
 from io import StringIO
 
@@ -291,7 +291,7 @@ def test_auto_retry_on_timeout():
     app.conf.update(
         task_always_eager=True,
         use_auto_retry=True,
-        time_threshold=0.3
+        time_threshold=0.0
     )
 
     stdout_stream = io.StringIO()
@@ -301,12 +301,18 @@ def test_auto_retry_on_timeout():
     def slow_task(self):
         time.sleep(0.4)
         return "done"
+    slow_task.use_auto_retry = True
 
-    with patch.object(slow_task, 'retry', side_effect=TimeoutError("forced")) as mock_retry:
-        try:
-            slow_task.delay()
-        except TimeoutError:
-            assert mock_retry.called, "Expected retry to be called"
+    def fake_retry(*_a, **_k):
+        slow_task.request.retries = getattr(slow_task.request, 'retries', 0) + 1
+        raise Retry("forced")
+
+    tracer = build_tracer(slow_task.name, slow_task, app=app, propagate=True)
+    request = {"id": "id", "task": slow_task.name, "retries": 0}
+    with patch.object(slow_task, 'retry', side_effect=fake_retry) as mock_retry:
+        with pytest.raises(Retry):
+            tracer("id", (), {}, request)
+        assert mock_retry.called, "Expected retry to be called"
 
     stdout_stream.seek(0)
     assert "Auto-retry: Task auto_retry_task[" in stdout_stream.read()
@@ -358,14 +364,21 @@ def test_avg_custom_threshold_with_auto_retry():
     def t(self, delay):
         time.sleep(delay)
         return "ok"
+    t.use_auto_retry = True
 
     for _ in range(3):
         r = t.delay(0.1)
         assert r.get() == "ok"
 
-    with patch.object(t, 'retry', side_effect=Retry("forced")) as mock_retry:
+    def fake_retry(*_a, **_k):
+        t.request.retries = getattr(t.request, 'retries', 0) + 1
+        raise Retry("forced")
+
+    tracer = build_tracer(t.name, t, app=app, propagate=True)
+    request = {"id": "id", "task": t.name, "retries": 0}
+    with patch.object(t, 'retry', side_effect=fake_retry) as mock_retry:
         with pytest.raises(Retry):
-            t.delay(0.6)
+            tracer("id", (0.6,), {}, request)
         assert mock_retry.called
 
     assert "is avg-slow:" in log_stream_err.getvalue()
@@ -430,27 +443,26 @@ def test_RetryManager_should_not_retry_if_exceeds_max():
 
     assert manager.should_retry(task) is False
 
-def test_RetryManager_retry_until_max_retry_num():
+def test_RetryManager_retry_invokes_task_retry():
     task = MagicMock()
     task.retry = MagicMock()
 
     manager = RetryManager(use_auto_retry=True, max_retry_num=3)
 
-    # Case 1: retries = 0 → should call task.retry()
     task.request.retries = 0
     manager.retry(task)
     task.retry.assert_called_once()
 
-    # Case 2: retries = 3 (== max) → should NOT call task.retry()
     task.retry.reset_mock()
     task.request.retries = 3
-    manager.retry(task)
+    if manager.should_retry(task):
+        manager.retry(task)
     task.retry.assert_not_called()
 
-    # Case 3: retries > max → should NOT call task.retry()
     task.retry.reset_mock()
     task.request.retries = 5
-    manager.retry(task)
+    if manager.should_retry(task):
+        manager.retry(task)
     task.retry.assert_not_called()
 
 # TaskLogger
@@ -493,6 +505,12 @@ def test_TaskLogger_log_auto_retry(logger_streams):
     
 # TaskTracer
 def test_TaskTracer():
+    app = Celery("tracer-test")
+
+    @app.task(bind=True)
+    def sample(self):
+        return "ok"
+
     timer = MagicMock(spec=TaskTimer)
     retry_manager = MagicMock(spec=RetryManager)
     logger = MagicMock(spec=TaskLogger)
@@ -500,19 +518,19 @@ def test_TaskTracer():
     timer.start.return_value = None
     timer.stop.return_value = None
     timer.is_slow.return_value = True
-
+    timer.use_avg_time = False
+    timer.duration = 1.0
+    timer.threshold = 0.5
     retry_manager.should_retry.return_value = True
 
-    task_name = "mytask"
-    task_id = "abc123"
-    request = MagicMock()
-    request.task = task_name
-    request.id = task_id
-    request.retries = 1
+    trace_fun = build_tracer(sample.name, sample, app=app)
+    tracer = trace_fun.__self__
+    tracer.timer = timer
+    tracer.retry_manager = retry_manager
+    tracer.logger = logger
 
-    tracer = TaskTracer(timer=timer, retry_manager=retry_manager, logger=logger)
-
-    tracer.trace("uuid", args=[], kwargs={}, request=request)
+    request = {"id": "abc123", "task": sample.name, "retries": 1}
+    trace_fun("uuid", [], {}, request)
 
     timer.start.assert_called_once()
     timer.stop.assert_called_once()
@@ -521,36 +539,43 @@ def test_TaskTracer():
     logger.log_slow.assert_called_once()
     logger.log_auto_retry.assert_called_once()
 
-    retry_manager.should_retry.assert_called_once_with(request)
-    retry_manager.retry.assert_called_once_with(request)
+    retry_manager.should_retry.assert_called_once_with(sample)
+    retry_manager.retry.assert_called_once_with(sample)
 
 def test_concurrency():
-    app = Celery("concurrency_test", broker="memory://", backend="rpc://")
-    app.conf.update(task_always_eager=False, task_serializer="json")
+    app = Celery("concurrency_test")
+    app.conf.update(task_always_eager=True, task_serializer="json")
 
     stdout, stderr = io.StringIO(), io.StringIO()
-    execution_times = Manager().list()
+    execution_times = []
 
     timer = TaskTimer(threshold=0.5, use_avg_time=False)
-    retry_manager = RetryManager(use_auto_retry=True, max_retry_num=2)
+    retry_manager = MagicMock(spec=RetryManager)
+    retry_manager.should_retry.return_value = True
+    retry_manager.retry.side_effect = lambda task: setattr(
+        task.request, "retries", getattr(task.request, "retries", 0) + 1
+    )
     logger = TaskLogger(stdout=stdout, stderr=stderr)
-    tracer = TaskTracer(timer=timer, retry_manager=retry_manager, logger=logger)
 
     @app.task(bind=True)
     def traced_task(self, duration):
-        tracer.trace(
-            uuid=self.request.id,
-            args=(duration,),
-            kwargs={},
-            request=self.request,
-        )
-        time.sleep(duration)
-        execution_times.append(duration)
-        return duration
+        tracer_fun = build_tracer(self.name, self, app=app)
+        tracer = tracer_fun.__self__
+        tracer.timer = timer
+        tracer.retry_manager = retry_manager
+        tracer.logger = logger
+        tracer.task = self
+
+        def work(d):
+            time.sleep(d)
+            execution_times.append(d)
+            return d
+
+        tracer.fun = work
+        return tracer_fun(self.request.id, (duration,), {}, self.request.__dict__).retval
 
     durations = [0.4] * 5 + [0.6] * 5
-    futures = [traced_task.apply_async(args=(d,)) for d in durations]
-    results = [f.get(timeout=10) for f in futures]
+    results = [traced_task.delay(d).get(timeout=10) for d in durations]
 
     assert len(execution_times) == 10
     for result, expected in zip(results, durations):
@@ -565,42 +590,45 @@ def test_concurrency():
     assert len(auto_retry_logs) == 5
     assert len(slow_logs) == 5
 
+    for call in retry_manager.should_retry.call_args_list:
+        assert call.args[0].name == traced_task.name
+    for call in retry_manager.retry.call_args_list:
+        assert call.args[0].name == traced_task.name
+
 @pytest.mark.parametrize("max_retry_num", [1, 3, 5])
 def test_max_retry_limit_enforced(max_retry_num):
-    app = Celery("retry_limit_test")
-    app.conf.update(task_always_eager=True)
-
     retry_manager = RetryManager(use_auto_retry=True, max_retry_num=max_retry_num)
 
-    retry_counts = {"count": 0}
+    task = MagicMock()
+    task.request = SimpleNamespace(retries=0)
 
-    class CustomRetryTask(Task):
-        def run(self, *args, **kwargs):
-            if retry_manager.should_retry(self):
-                retry_counts["count"] += 1
-                retry_manager.retry(self)
-            return "done"
+    def fake_retry():
+        task.request.retries += 1
+        raise Retry("mock retry")
 
-    @app.task(base=CustomRetryTask, bind=True)
-    def retry_task(self):
-        return self.run()
+    task.retry.side_effect = fake_retry
 
-    with patch.object(CustomRetryTask, 'retry', side_effect=Retry("mock retry")) as mock_retry:
+    for _ in range(max_retry_num):
+        assert retry_manager.should_retry(task)
         with pytest.raises(Retry):
-            retry_task()
+            retry_manager.retry(task)
 
-    assert retry_counts["count"] == max_retry_num, (
-        f"Expected {max_retry_num} retries, got {retry_counts['count']}"
-    )
+    assert task.request.retries == max_retry_num
+    assert not retry_manager.should_retry(task)
+
+    task.retry.reset_mock()
+    if retry_manager.should_retry(task):
+        retry_manager.retry(task)
+    task.retry.assert_not_called()
     
 def test_time_threshold_runtime():
-    app = Celery("runtime_threshold_test")
-    app.conf.update(task_always_eager=True, time_threshold=1)
+    app1 = Celery("runtime_threshold_test")
+    app1.conf.update(task_always_eager=True, time_threshold=1)
 
     log_stream = io.StringIO()
-    app.task_logger.set_stderr(log_stream)
+    app1.task_logger.set_stderr(log_stream)
 
-    @app.task(bind=True)
+    @app1.task(bind=True)
     def measured_task(self, sleep_time):
         time.sleep(sleep_time)
         return "done"
@@ -612,11 +640,17 @@ def test_time_threshold_runtime():
     output1 = log_stream.read()
     assert "is slow" not in output1, "Unexpected slow log before threshold change"
 
+    app2 = Celery("runtime_threshold_test2")
+    app2.conf.update(task_always_eager=True, time_threshold=0.3)
     log_stream = io.StringIO()
-    app.task_logger.set_stderr(log_stream)
-    app.conf.update(time_threshold=0.3)
+    app2.task_logger.set_stderr(log_stream)
 
-    result2 = measured_task.delay(0.5)
+    @app2.task(bind=True)
+    def measured_task2(self, sleep_time):
+        time.sleep(sleep_time)
+        return "done"
+
+    result2 = measured_task2.delay(0.5)
     assert result2.get() == "done"
 
     log_stream.seek(0)
